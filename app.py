@@ -13,9 +13,9 @@ import zipfile
 from pathlib import Path
 
 import cv2
-import mediapipe as mp
 import numpy as np
 import streamlit as st
+from mediapipe.tasks.python import BaseOptions, vision
 from PIL import Image
 
 # ─── Constants ───────────────────────────────────────────────────────────────
@@ -26,6 +26,7 @@ DEFAULT_POSE_PICKS = 5        # Default number of pose picks
 MIN_MOTION_PERCENTILE = 30    # Only consider frames above this motion percentile
 POSE_SAMPLE_STEP_DIVIDER = 300  # Sample ~300 frames for pose analysis
 MIN_POSE_GAP_SECONDS = 1.5   # Minimum gap between selected pose frames
+POSE_MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pose_landmarker_lite.task")
 
 
 # ─── Core helpers ─────────────────────────────────────────────────────────────
@@ -91,12 +92,13 @@ def _compute_motion_scores(cap: cv2.VideoCapture, sample_step: int) -> list[tupl
 
 # ─── Pose detection helpers ──────────────────────────────────────────────────
 
-def _compute_pose_extension(landmarks) -> float:
+def _compute_pose_extension(landmarks: list) -> float:
     """
     Score how 'extended' a pose is — high scores mean big jumps, wide splits,
-    arms thrown out, etc. Uses MediaPipe landmark positions.
+    arms thrown out, etc.
+    Uses the new MediaPipe Tasks API landmark list (list of NormalizedLandmark).
     """
-    lm = landmarks.landmark
+    lm = landmarks  # list indexed by landmark ID
 
     # Key landmark indices (MediaPipe Pose)
     NOSE = 0
@@ -224,12 +226,16 @@ def select_pose_frames(
     sample_step = max(1, total_frames // POSE_SAMPLE_STEP_DIVIDER)
     pose_scores: list[tuple[int, float]] = []
 
-    mp_pose = mp.solutions.pose
-    with mp_pose.Pose(
-        static_image_mode=True,
-        model_complexity=1,
-        min_detection_confidence=0.5,
-    ) as pose:
+    # New Tasks API — create PoseLandmarker
+    options = vision.PoseLandmarkerOptions(
+        base_options=BaseOptions(model_asset_path=POSE_MODEL_PATH),
+        num_poses=1,
+        min_pose_detection_confidence=0.5,
+        min_pose_presence_confidence=0.5,
+    )
+    import mediapipe as _mp
+
+    with vision.PoseLandmarker.create_from_options(options) as landmarker:
         cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
         frame_idx = 0
 
@@ -242,10 +248,11 @@ def select_pose_frames(
                 # Resize for speed
                 small = cv2.resize(frame, (320, 180))
                 rgb = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
-                results = pose.process(rgb)
+                mp_image = _mp.Image(image_format=_mp.ImageFormat.SRGB, data=rgb)
+                results = landmarker.detect(mp_image)
 
-                if results.pose_landmarks:
-                    ext_score = _compute_pose_extension(results.pose_landmarks)
+                if results.pose_landmarks and len(results.pose_landmarks) > 0:
+                    ext_score = _compute_pose_extension(results.pose_landmarks[0])
                     pose_scores.append((frame_idx, ext_score))
 
             frame_idx += 1
