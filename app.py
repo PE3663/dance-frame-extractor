@@ -20,14 +20,14 @@ from PIL import Image
 
 # ─── Constants ───────────────────────────────────────────────────────────────
 
-MAX_WIDTH = 1280              # Max pixel width when downscaling frames
+MAX_WIDTH = 3840              # Max pixel width — preserve full HD / 4K quality
 TARGET_FRAMES = 11            # How many motion frames to surface
 DEFAULT_POSE_PICKS = 5        # Default number of pose picks
 MIN_MOTION_PERCENTILE = 30    # Only consider frames above this motion percentile
 POSE_SAMPLE_STEP_DIVIDER = 300  # Sample ~300 frames for pose analysis
 MIN_POSE_GAP_SECONDS = 1.5   # Minimum gap between selected pose frames
 DEFAULT_SPOTLIGHT_PICKS = 4  # Default number of solo spotlight picks
-CROP_PADDING = 0.25          # Extra padding around cropped dancer (fraction of bbox)
+CROP_PADDING = 0.40          # Extra padding around cropped dancer (fraction of bbox)
 MIN_DANCERS_FOR_SPOTLIGHT = 2  # Only spotlight when this many dancers detected
 POSE_MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pose_landmarker_lite.task")
 
@@ -376,31 +376,53 @@ def _get_dancer_bbox(landmarks: list, img_w: int, img_h: int) -> tuple[int, int,
     return x1, y1, x2, y2
 
 
+def _get_dancer_center(landmarks: list) -> tuple[float, float]:
+    """Get the hip midpoint of a dancer (normalized 0-1 coords)."""
+    hip_x = (landmarks[23].x + landmarks[24].x) / 2
+    hip_y = (landmarks[23].y + landmarks[24].y) / 2
+    return hip_x, hip_y
+
+
 def _score_standout(dancer_landmarks: list, all_dancers: list[list], dancer_idx: int) -> float:
     """
     Score how much a single dancer stands out from the group.
-    High score = this dancer is doing something notably different from the others.
-    Combines:
-      - Individual pose extension (absolute quality of the pose)
-      - Deviation from group average (how different from everyone else)
-      - Spatial prominence (how centered / forward the dancer is)
+    Prioritises spatial isolation — a dancer physically separated from everyone else.
+    Also rewards dynamic poses (extension, jump height).
     """
-    # Individual extension score
     ext = _compute_pose_extension(dancer_landmarks)
+    my_cx, my_cy = _get_dancer_center(dancer_landmarks)
 
-    # Group deviation — how different is this dancer's pose from the average?
+    # ── Spatial isolation: min distance to any other dancer ──
+    min_dist = float("inf")
+    other_centers = []
+    for i, dlm in enumerate(all_dancers):
+        if i == dancer_idx:
+            continue
+        ox, oy = _get_dancer_center(dlm)
+        other_centers.append((ox, oy))
+        dist = math.hypot(my_cx - ox, my_cy - oy)
+        if dist < min_dist:
+            min_dist = dist
+
+    if not other_centers:
+        isolation = 0.0
+    else:
+        # Also compute average distance to group centroid
+        gx = np.mean([c[0] for c in other_centers])
+        gy = np.mean([c[1] for c in other_centers])
+        dist_to_centroid = math.hypot(my_cx - gx, my_cy - gy)
+        # Isolation combines nearest-neighbour and centroid distance
+        isolation = min_dist * 0.6 + dist_to_centroid * 0.4
+
+    # ── Pose deviation from group average ──
     if len(all_dancers) >= MIN_DANCERS_FOR_SPOTLIGHT:
         lm = dancer_landmarks
-        # Compute key metrics for this dancer
         my_metrics = np.array([
-            lm[15].y, lm[16].y,  # wrist heights
-            lm[27].y, lm[28].y,  # ankle heights
-            abs(lm[15].x - lm[16].x),  # arm spread
-            abs(lm[27].x - lm[28].x),  # leg spread
-            (lm[23].y + lm[24].y) / 2,  # hip height
+            lm[15].y, lm[16].y,
+            lm[27].y, lm[28].y,
+            abs(lm[15].x - lm[16].x),
+            abs(lm[27].x - lm[28].x),
         ])
-
-        # Compute same metrics for all dancers
         all_metrics = []
         for i, dlm in enumerate(all_dancers):
             if i == dancer_idx:
@@ -410,23 +432,13 @@ def _score_standout(dancer_landmarks: list, all_dancers: list[list], dancer_idx:
                 dlm[27].y, dlm[28].y,
                 abs(dlm[15].x - dlm[16].x),
                 abs(dlm[27].x - dlm[28].x),
-                (dlm[23].y + dlm[24].y) / 2,
             ]))
-
-        if all_metrics:
-            group_avg = np.mean(all_metrics, axis=0)
-            deviation = float(np.linalg.norm(my_metrics - group_avg))
-        else:
-            deviation = 0.0
+        deviation = float(np.linalg.norm(my_metrics - np.mean(all_metrics, axis=0))) if all_metrics else 0.0
     else:
         deviation = 0.0
 
-    # Spatial prominence — center of frame is more prominent
-    hip_x = (dancer_landmarks[23].x + dancer_landmarks[24].x) / 2
-    center_bonus = 1.0 - abs(hip_x - 0.5) * 2  # 1.0 at center, 0.0 at edges
-
-    # Combined score: 50% extension, 35% deviation, 15% center
-    return ext * 0.50 + deviation * 8.0 * 0.35 + center_bonus * 3.0 * 0.15
+    # Combined: 45% isolation, 30% extension, 25% pose deviation
+    return isolation * 10.0 * 0.45 + ext * 0.30 + deviation * 5.0 * 0.25
 
 
 def select_spotlight_frames(
@@ -446,14 +458,15 @@ def select_spotlight_frames(
     if total_frames < 10 or n <= 0:
         return []
 
-    sample_step = max(1, total_frames // POSE_SAMPLE_STEP_DIVIDER)
+    # Sample more densely for spotlight — we need to catch fleeting solo moments
+    sample_step = max(1, total_frames // (POSE_SAMPLE_STEP_DIVIDER * 2))
 
     # Multi-person pose detection
     options = vision.PoseLandmarkerOptions(
         base_options=BaseOptions(model_asset_path=POSE_MODEL_PATH),
-        num_poses=8,  # detect up to 8 dancers
-        min_pose_detection_confidence=0.4,
-        min_pose_presence_confidence=0.4,
+        num_poses=10,  # detect up to 10 dancers
+        min_pose_detection_confidence=0.5,
+        min_pose_presence_confidence=0.5,
     )
     import mediapipe as _mp
 
@@ -470,7 +483,7 @@ def select_spotlight_frames(
                 break
 
             if frame_idx % sample_step == 0:
-                small = cv2.resize(frame, (480, 270))  # slightly larger for multi-person
+                small = cv2.resize(frame, (960, 540))  # higher res for reliable multi-person detection
                 rgb = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
                 mp_image = _mp.Image(image_format=_mp.ImageFormat.SRGB, data=rgb)
                 results = landmarker.detect(mp_image)
@@ -535,8 +548,12 @@ def select_spotlight_frames(
             frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             img_h, img_w = frame_rgb.shape[:2]
 
-            # Re-detect at higher res for accurate bbox
-            detect_rgb = cv2.resize(frame_rgb, (640, 360))
+            # Re-detect at full res (capped at 1280) for accurate bbox
+            if img_w > 1280:
+                scale = 1280 / img_w
+                detect_rgb = cv2.resize(frame_rgb, (1280, int(img_h * scale)))
+            else:
+                detect_rgb = frame_rgb.copy()
             mp_image = _mp.Image(image_format=_mp.ImageFormat.SRGB, data=detect_rgb)
             results = landmarker.detect(mp_image)
 
@@ -562,17 +579,19 @@ def select_spotlight_frames(
                 dancer_lm = all_lm[best_idx]
                 x1, y1, x2, y2 = _get_dancer_bbox(dancer_lm, img_w, img_h)
 
-                # Ensure minimum crop size
+                # Ensure minimum crop size for a usable close-up
                 crop_w = x2 - x1
                 crop_h = y2 - y1
-                if crop_w < 100:
+                min_crop_w = max(300, img_w // 4)
+                min_crop_h = max(400, img_h // 3)
+                if crop_w < min_crop_w:
                     cx = (x1 + x2) // 2
-                    x1 = max(0, cx - 50)
-                    x2 = min(img_w, cx + 50)
-                if crop_h < 150:
+                    x1 = max(0, cx - min_crop_w // 2)
+                    x2 = min(img_w, cx + min_crop_w // 2)
+                if crop_h < min_crop_h:
                     cy = (y1 + y2) // 2
-                    y1 = max(0, cy - 75)
-                    y2 = min(img_h, cy + 75)
+                    y1 = max(0, cy - min_crop_h // 2)
+                    y2 = min(img_h, cy + min_crop_h // 2)
 
                 cropped = full_img.crop((x1, y1, x2, y2))
             else:
@@ -669,7 +688,7 @@ def select_frames(cap: cv2.VideoCapture, n: int = TARGET_FRAMES) -> tuple[list[I
     return images, scores, set(final_indices)
 
 
-def image_to_jpeg_bytes(img: Image.Image, quality: int = 88) -> bytes:
+def image_to_jpeg_bytes(img: Image.Image, quality: int = 95) -> bytes:
     """Encode a PIL Image to JPEG bytes."""
     buf = io.BytesIO()
     img.save(buf, format="JPEG", quality=quality, optimize=True)
