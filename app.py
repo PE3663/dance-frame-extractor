@@ -32,6 +32,56 @@ MIN_DANCERS_FOR_SPOTLIGHT = 2  # Only spotlight when this many dancers detected
 POSE_MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pose_landmarker_lite.task")
 
 
+# ─── Sharpness helpers ────────────────────────────────────────────────────────
+
+BLUR_SEARCH_RADIUS = 5        # How many frames before/after to search for a sharper alternative
+MIN_SHARPNESS = 50.0          # Laplacian variance below this = blurry
+
+
+def _frame_sharpness(frame: np.ndarray) -> float:
+    """Compute sharpness of a BGR frame using Laplacian variance.
+    Higher = sharper. Typical sharp frame > 100, blurry < 40."""
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    # Evaluate on a downscaled version for speed
+    gray = cv2.resize(gray, (640, 360))
+    return float(cv2.Laplacian(gray, cv2.CV_64F).var())
+
+
+def _find_sharpest_nearby(
+    cap: cv2.VideoCapture,
+    target_idx: int,
+    radius: int = BLUR_SEARCH_RADIUS,
+) -> tuple[int, np.ndarray]:
+    """Read target frame + nearby frames, return the sharpest (idx, bgr_frame).
+    Searches target-radius..target+radius, returns the one with highest sharpness."""
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    start = max(0, target_idx - radius)
+    end = min(total - 1, target_idx + radius)
+
+    best_idx = target_idx
+    best_frame = None
+    best_sharp = -1.0
+
+    for idx in range(start, end + 1):
+        cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+        ret, frame = cap.read()
+        if not ret:
+            continue
+        sharp = _frame_sharpness(frame)
+        if sharp > best_sharp:
+            best_sharp = sharp
+            best_idx = idx
+            best_frame = frame
+
+    if best_frame is None:
+        # Fallback: just read the target
+        cap.set(cv2.CAP_PROP_POS_FRAMES, target_idx)
+        ret, frame = cap.read()
+        return target_idx, frame
+
+    return best_idx, best_frame
+
+
 # ─── Core helpers ─────────────────────────────────────────────────────────────
 
 def load_video(uploaded_file) -> tuple[cv2.VideoCapture, str]:
@@ -317,12 +367,11 @@ def select_pose_frames(
 
     selected_indices.sort()
 
-    # ── Phase 5: Decode frames ────────────────────────────────────────────
+    # ── Phase 5: Decode frames (with sharpness search) ────────────────────
     results_out: list[tuple[Image.Image, str]] = []
     for idx in selected_indices:
-        cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
-        ret, frame = cap.read()
-        if not ret:
+        sharp_idx, frame = _find_sharpest_nearby(cap, idx)
+        if frame is None:
             continue
         frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         img = Image.fromarray(frame_rgb)
@@ -534,15 +583,14 @@ def select_spotlight_frames(
 
     selected.sort(key=lambda x: x[0])
 
-    # Decode frames and crop
-    # We need to re-detect on full-res frames for accurate cropping
+    # Decode frames and crop (with sharpness search)
     results_out: list[tuple[Image.Image, Image.Image, str]] = []
 
     with vision.PoseLandmarker.create_from_options(options) as landmarker:
         for frame_idx, score, best_dancer_hint, num_dancers in selected:
-            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
-            ret, frame = cap.read()
-            if not ret:
+            # Find the sharpest frame nearby to avoid motion blur
+            sharp_idx, frame = _find_sharpest_nearby(cap, frame_idx)
+            if frame is None:
                 continue
 
             frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -605,7 +653,7 @@ def select_spotlight_frames(
                     min(img_h, cy + crop_size),
                 ))
 
-            timestamp = frame_idx / fps
+            timestamp = sharp_idx / fps
             mins = int(timestamp // 60)
             secs = timestamp % 60
             label = f"Solo Spotlight ({num_dancers} dancers) @ {mins}:{secs:04.1f}"
@@ -670,9 +718,9 @@ def select_frames(cap: cv2.VideoCapture, n: int = TARGET_FRAMES) -> tuple[list[I
     images: list[Image.Image] = []
     final_indices: list[int] = []
     for idx in selected_indices:
-        cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
-        ret, frame = cap.read()
-        if not ret:
+        # Pick the sharpest frame within a small window around the candidate
+        sharp_idx, frame = _find_sharpest_nearby(cap, idx)
+        if frame is None:
             continue
         frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         img = Image.fromarray(frame_rgb)
@@ -680,7 +728,7 @@ def select_frames(cap: cv2.VideoCapture, n: int = TARGET_FRAMES) -> tuple[list[I
             ratio = MAX_WIDTH / img.width
             img = img.resize((MAX_WIDTH, int(img.height * ratio)), Image.LANCZOS)
         images.append(img)
-        final_indices.append(idx)
+        final_indices.append(sharp_idx)
 
     if not images:
         raise ValueError("Could not decode any frames from the video.")
