@@ -26,6 +26,9 @@ DEFAULT_POSE_PICKS = 5        # Default number of pose picks
 MIN_MOTION_PERCENTILE = 30    # Only consider frames above this motion percentile
 POSE_SAMPLE_STEP_DIVIDER = 300  # Sample ~300 frames for pose analysis
 MIN_POSE_GAP_SECONDS = 1.5   # Minimum gap between selected pose frames
+DEFAULT_SPOTLIGHT_PICKS = 4  # Default number of solo spotlight picks
+CROP_PADDING = 0.25          # Extra padding around cropped dancer (fraction of bbox)
+MIN_DANCERS_FOR_SPOTLIGHT = 2  # Only spotlight when this many dancers detected
 POSE_MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pose_landmarker_lite.task")
 
 
@@ -349,6 +352,250 @@ def select_pose_frames(
     return results_out
 
 
+def _get_dancer_bbox(landmarks: list, img_w: int, img_h: int) -> tuple[int, int, int, int]:
+    """
+    Compute a bounding box (x1, y1, x2, y2) around a single dancer's landmarks.
+    Adds CROP_PADDING around the extremes.
+    """
+    xs = [lm.x * img_w for lm in landmarks]
+    ys = [lm.y * img_h for lm in landmarks]
+
+    x1, x2 = min(xs), max(xs)
+    y1, y2 = min(ys), max(ys)
+
+    w = x2 - x1
+    h = y2 - y1
+    pad_x = w * CROP_PADDING
+    pad_y = h * CROP_PADDING
+
+    x1 = max(0, int(x1 - pad_x))
+    y1 = max(0, int(y1 - pad_y))
+    x2 = min(img_w, int(x2 + pad_x))
+    y2 = min(img_h, int(y2 + pad_y))
+
+    return x1, y1, x2, y2
+
+
+def _score_standout(dancer_landmarks: list, all_dancers: list[list], dancer_idx: int) -> float:
+    """
+    Score how much a single dancer stands out from the group.
+    High score = this dancer is doing something notably different from the others.
+    Combines:
+      - Individual pose extension (absolute quality of the pose)
+      - Deviation from group average (how different from everyone else)
+      - Spatial prominence (how centered / forward the dancer is)
+    """
+    # Individual extension score
+    ext = _compute_pose_extension(dancer_landmarks)
+
+    # Group deviation — how different is this dancer's pose from the average?
+    if len(all_dancers) >= MIN_DANCERS_FOR_SPOTLIGHT:
+        lm = dancer_landmarks
+        # Compute key metrics for this dancer
+        my_metrics = np.array([
+            lm[15].y, lm[16].y,  # wrist heights
+            lm[27].y, lm[28].y,  # ankle heights
+            abs(lm[15].x - lm[16].x),  # arm spread
+            abs(lm[27].x - lm[28].x),  # leg spread
+            (lm[23].y + lm[24].y) / 2,  # hip height
+        ])
+
+        # Compute same metrics for all dancers
+        all_metrics = []
+        for i, dlm in enumerate(all_dancers):
+            if i == dancer_idx:
+                continue
+            all_metrics.append(np.array([
+                dlm[15].y, dlm[16].y,
+                dlm[27].y, dlm[28].y,
+                abs(dlm[15].x - dlm[16].x),
+                abs(dlm[27].x - dlm[28].x),
+                (dlm[23].y + dlm[24].y) / 2,
+            ]))
+
+        if all_metrics:
+            group_avg = np.mean(all_metrics, axis=0)
+            deviation = float(np.linalg.norm(my_metrics - group_avg))
+        else:
+            deviation = 0.0
+    else:
+        deviation = 0.0
+
+    # Spatial prominence — center of frame is more prominent
+    hip_x = (dancer_landmarks[23].x + dancer_landmarks[24].x) / 2
+    center_bonus = 1.0 - abs(hip_x - 0.5) * 2  # 1.0 at center, 0.0 at edges
+
+    # Combined score: 50% extension, 35% deviation, 15% center
+    return ext * 0.50 + deviation * 8.0 * 0.35 + center_bonus * 3.0 * 0.15
+
+
+def select_spotlight_frames(
+    cap: cv2.VideoCapture,
+    n: int,
+    already_selected: set[int],
+) -> list[tuple[Image.Image, Image.Image, str]]:
+    """
+    Find frames where one dancer stands out from a group.
+    Returns list of (full_frame, cropped_closeup, label).
+    Uses multi-person pose detection.
+    """
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    min_gap_frames = int(fps * MIN_POSE_GAP_SECONDS)
+
+    if total_frames < 10 or n <= 0:
+        return []
+
+    sample_step = max(1, total_frames // POSE_SAMPLE_STEP_DIVIDER)
+
+    # Multi-person pose detection
+    options = vision.PoseLandmarkerOptions(
+        base_options=BaseOptions(model_asset_path=POSE_MODEL_PATH),
+        num_poses=8,  # detect up to 8 dancers
+        min_pose_detection_confidence=0.4,
+        min_pose_presence_confidence=0.4,
+    )
+    import mediapipe as _mp
+
+    # Collect: (frame_idx, standout_score, best_dancer_idx, num_dancers, all_landmarks)
+    candidates: list[tuple[int, float, int, int, list]] = []
+
+    with vision.PoseLandmarker.create_from_options(options) as landmarker:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+        frame_idx = 0
+
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+            if frame_idx % sample_step == 0:
+                small = cv2.resize(frame, (480, 270))  # slightly larger for multi-person
+                rgb = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
+                mp_image = _mp.Image(image_format=_mp.ImageFormat.SRGB, data=rgb)
+                results = landmarker.detect(mp_image)
+
+                if results.pose_landmarks and len(results.pose_landmarks) >= MIN_DANCERS_FOR_SPOTLIGHT:
+                    all_landmarks = results.pose_landmarks
+                    best_score = -1.0
+                    best_idx = 0
+
+                    for i, dancer_lm in enumerate(all_landmarks):
+                        score = _score_standout(dancer_lm, all_landmarks, i)
+                        if score > best_score:
+                            best_score = score
+                            best_idx = i
+
+                    candidates.append((
+                        frame_idx,
+                        best_score,
+                        best_idx,
+                        len(all_landmarks),
+                        all_landmarks,
+                    ))
+
+            frame_idx += 1
+
+    if not candidates:
+        return []
+
+    # Rank by standout score
+    candidates.sort(key=lambda x: x[1], reverse=True)
+
+    # Select top N with gap enforcement
+    selected: list[tuple[int, float, int, int]] = []
+    for frame_idx, score, best_dancer, num_dancers, _ in candidates:
+        if frame_idx in already_selected:
+            continue
+        too_close = any(
+            abs(frame_idx - s[0]) < min_gap_frames
+            for s in selected
+        ) or any(
+            abs(frame_idx - si) < min_gap_frames
+            for si in already_selected
+        )
+        if not too_close:
+            selected.append((frame_idx, score, best_dancer, num_dancers))
+        if len(selected) >= n:
+            break
+
+    selected.sort(key=lambda x: x[0])
+
+    # Decode frames and crop
+    # We need to re-detect on full-res frames for accurate cropping
+    results_out: list[tuple[Image.Image, Image.Image, str]] = []
+
+    with vision.PoseLandmarker.create_from_options(options) as landmarker:
+        for frame_idx, score, best_dancer_hint, num_dancers in selected:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+            ret, frame = cap.read()
+            if not ret:
+                continue
+
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            img_h, img_w = frame_rgb.shape[:2]
+
+            # Re-detect at higher res for accurate bbox
+            detect_rgb = cv2.resize(frame_rgb, (640, 360))
+            mp_image = _mp.Image(image_format=_mp.ImageFormat.SRGB, data=detect_rgb)
+            results = landmarker.detect(mp_image)
+
+            full_img = Image.fromarray(frame_rgb)
+            if full_img.width > MAX_WIDTH:
+                ratio = MAX_WIDTH / full_img.width
+                full_img = full_img.resize(
+                    (MAX_WIDTH, int(full_img.height * ratio)), Image.LANCZOS
+                )
+                img_w, img_h = full_img.size
+
+            if results.pose_landmarks and len(results.pose_landmarks) >= MIN_DANCERS_FOR_SPOTLIGHT:
+                # Re-score to find the best dancer on the full-res detection
+                all_lm = results.pose_landmarks
+                best_score = -1.0
+                best_idx = 0
+                for i, dlm in enumerate(all_lm):
+                    s = _score_standout(dlm, all_lm, i)
+                    if s > best_score:
+                        best_score = s
+                        best_idx = i
+
+                dancer_lm = all_lm[best_idx]
+                x1, y1, x2, y2 = _get_dancer_bbox(dancer_lm, img_w, img_h)
+
+                # Ensure minimum crop size
+                crop_w = x2 - x1
+                crop_h = y2 - y1
+                if crop_w < 100:
+                    cx = (x1 + x2) // 2
+                    x1 = max(0, cx - 50)
+                    x2 = min(img_w, cx + 50)
+                if crop_h < 150:
+                    cy = (y1 + y2) // 2
+                    y1 = max(0, cy - 75)
+                    y2 = min(img_h, cy + 75)
+
+                cropped = full_img.crop((x1, y1, x2, y2))
+            else:
+                # Fallback: center crop
+                cx, cy = img_w // 2, img_h // 2
+                crop_size = min(img_w, img_h) // 2
+                cropped = full_img.crop((
+                    max(0, cx - crop_size // 2),
+                    max(0, cy - crop_size),
+                    min(img_w, cx + crop_size // 2),
+                    min(img_h, cy + crop_size),
+                ))
+
+            timestamp = frame_idx / fps
+            mins = int(timestamp // 60)
+            secs = timestamp % 60
+            label = f"Solo Spotlight ({num_dancers} dancers) @ {mins}:{secs:04.1f}"
+
+            results_out.append((full_img, cropped, label))
+
+    return results_out
+
+
 def select_frames(cap: cv2.VideoCapture, n: int = TARGET_FRAMES) -> tuple[list[Image.Image], list[tuple[int, float]], set[int]]:
     """
     Select `n` high-energy frames from the video.
@@ -444,8 +691,10 @@ def create_combined_zip(
     motion_indices: list[int],
     pose_frames: list[tuple[Image.Image, str]],
     pose_indices: list[int],
+    spotlight_frames: list[tuple[Image.Image, Image.Image, str]] | None = None,
+    spotlight_indices: list[int] | None = None,
 ) -> bytes:
-    """Bundle selected motion and pose frames into one ZIP."""
+    """Bundle selected motion, pose, and spotlight frames into one ZIP."""
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
         for frame_idx in motion_indices:
@@ -456,6 +705,12 @@ def create_combined_zip(
             jpeg_bytes = image_to_jpeg_bytes(img)
             safe_label = label.replace(" ", "_").replace(":", "-").replace("/", "-")
             zf.writestr(f"poses/pose_{i + 1:02d}_{safe_label}.jpg", jpeg_bytes)
+        if spotlight_frames and spotlight_indices:
+            for j, sidx in enumerate(spotlight_indices):
+                full_img, crop_img, label = spotlight_frames[sidx]
+                safe_label = label.replace(" ", "_").replace(":", "-").replace("/", "-").replace("@", "at").replace("(", "").replace(")", "")
+                zf.writestr(f"spotlights/spotlight_{j + 1:02d}_wide_{safe_label}.jpg", image_to_jpeg_bytes(full_img))
+                zf.writestr(f"spotlights/spotlight_{j + 1:02d}_closeup_{safe_label}.jpg", image_to_jpeg_bytes(crop_img))
     return buf.getvalue()
 
 
@@ -607,6 +862,33 @@ def _inject_styles() -> None:
         /* ── Sidebar ── */
         [data-testid="stSidebar"] { background: #0d0d14; }
 
+        /* ── Spotlight cards ── */
+        .spotlight-card {
+            background: #13131a;
+            border: 1px solid #1a2a1a;
+            border-radius: 10px;
+            padding: 8px;
+            margin-bottom: 12px;
+            transition: border-color 0.18s, transform 0.18s;
+        }
+        .spotlight-card:hover {
+            border-color: #35c9ff;
+            transform: translateY(-2px);
+        }
+        .spotlight-label {
+            font-size: 0.68rem;
+            letter-spacing: 0.06em;
+            color: #35c9ff;
+            margin-top: 4px;
+            text-align: center;
+            font-weight: 500;
+        }
+        .spotlight-pair {
+            display: flex;
+            gap: 8px;
+            align-items: stretch;
+        }
+
         /* ── Slider ── */
         [data-testid="stSlider"] label {
             color: #c8c0b4 !important;
@@ -689,15 +971,27 @@ def main() -> None:
     st.divider()
 
     # ── Settings ──────────────────────────────────────────────────────────
-    pose_picks = st.slider(
-        "Pose picks — jumps, extensions & standout moments",
-        min_value=0,
-        max_value=15,
-        value=DEFAULT_POSE_PICKS,
-        step=1,
-        help="How many extra frames to find using AI pose detection + motion spike analysis. "
-             "Set to 0 to disable.",
-    )
+    settings_col1, settings_col2 = st.columns(2)
+    with settings_col1:
+        pose_picks = st.slider(
+            "Pose picks — jumps, extensions & standout moments",
+            min_value=0,
+            max_value=15,
+            value=DEFAULT_POSE_PICKS,
+            step=1,
+            help="How many extra frames to find using AI pose detection + motion spike analysis. "
+                 "Set to 0 to disable.",
+        )
+    with settings_col2:
+        spotlight_picks = st.slider(
+            "Solo spotlights — individuals standing out from the group",
+            min_value=0,
+            max_value=10,
+            value=DEFAULT_SPOTLIGHT_PICKS,
+            step=1,
+            help="Find moments where one dancer stands out from a group. "
+                 "Shows full frame + cropped close-up. Set to 0 to disable.",
+        )
 
     # ── Upload ────────────────────────────────────────────────────────────
     uploaded = st.file_uploader(
@@ -786,7 +1080,48 @@ def main() -> None:
                 st.session_state["pose_n"] = pose_picks
                 st.session_state["pose_file"] = uploaded.name
 
-    # Clean up temp file if both passes are done
+    # ── Process video (solo spotlights) ─────────────────────────────────
+    needs_spotlight_reprocess = (
+        spotlight_picks > 0
+        and (
+            "spotlight_frames" not in st.session_state
+            or st.session_state.get("spotlight_n") != spotlight_picks
+            or st.session_state.get("spotlight_file") != uploaded.name
+        )
+    )
+
+    if needs_spotlight_reprocess:
+        with st.spinner("Scanning for solo spotlight moments in group formations…"):
+            try:
+                tmp_path = st.session_state.get("_cap_path") or st.session_state.get("tmp_path")
+                if not tmp_path or not os.path.exists(tmp_path):
+                    uploaded.seek(0)
+                    cap, tmp_path = load_video(uploaded)
+                else:
+                    cap = cv2.VideoCapture(tmp_path)
+
+                try:
+                    # Combine motion + pose indices for gap enforcement
+                    all_selected = set(st.session_state.get("motion_indices", set()))
+                    spotlight_results = select_spotlight_frames(
+                        cap,
+                        spotlight_picks,
+                        all_selected,
+                    )
+                    st.session_state["spotlight_frames"] = spotlight_results
+                    st.session_state["spotlight_n"] = spotlight_picks
+                    st.session_state["spotlight_file"] = uploaded.name
+                    st.session_state["spotlight_selected"] = [True] * len(spotlight_results)
+                finally:
+                    cap.release()
+
+            except Exception as exc:
+                st.warning(f"Solo spotlight detection encountered an issue: {exc}")
+                st.session_state["spotlight_frames"] = []
+                st.session_state["spotlight_n"] = spotlight_picks
+                st.session_state["spotlight_file"] = uploaded.name
+
+    # Clean up temp file if all passes are done
     tmp_path = st.session_state.pop("_cap_path", None) or st.session_state.pop("tmp_path", None)
     if tmp_path and os.path.exists(tmp_path):
         try:
@@ -896,11 +1231,116 @@ def main() -> None:
         st.divider()
         st.info("No standout poses detected. Try a video with more dynamic movement.")
 
-    # ── Combined download ─────────────────────────────────────────────────
-    total_selected = n_motion_sel + len(pose_sel if pose_picks > 0 and pose_frames else [])
-    if total_selected > 0 and pose_picks > 0 and pose_frames:
+    # ── Spotlight Gallery ───────────────────────────────────────────────
+    spotlight_frames: list[tuple[Image.Image, Image.Image, str]] = st.session_state.get("spotlight_frames", [])
+    spotlight_sel: list[int] = []
+
+    if spotlight_picks > 0 and spotlight_frames:
         st.divider()
-        combined_zip = create_combined_zip(frames, motion_sel, pose_frames, pose_sel if pose_frames else [])
+        st.markdown(
+            '<p class="section-header">🔦 SOLO SPOTLIGHTS</p>'
+            f'<p class="section-desc">{len(spotlight_frames)} individuals standing out from the group — wide shot + close-up</p>',
+            unsafe_allow_html=True,
+        )
+
+        if "spotlight_selected" not in st.session_state or \
+           len(st.session_state["spotlight_selected"]) != len(spotlight_frames):
+            st.session_state["spotlight_selected"] = [True] * len(spotlight_frames)
+
+        for i, (full_img, crop_img, label) in enumerate(spotlight_frames):
+            st.markdown(f'<div class="spotlight-card">', unsafe_allow_html=True)
+            col_wide, col_crop = st.columns([3, 2])
+            with col_wide:
+                st.image(full_img, caption="Wide shot", use_container_width=True)
+            with col_crop:
+                st.image(crop_img, caption="Close-up", use_container_width=True)
+            st.markdown(
+                f'<p class="spotlight-label">{label}</p>',
+                unsafe_allow_html=True,
+            )
+            st.markdown("</div>", unsafe_allow_html=True)
+
+            ctrl_col1, ctrl_col2, ctrl_col3 = st.columns([2, 1, 1])
+            with ctrl_col1:
+                checked = st.checkbox(
+                    "Select",
+                    key=f"spotlight_chk_{i}",
+                    value=st.session_state["spotlight_selected"][i],
+                )
+                st.session_state["spotlight_selected"][i] = checked
+            with ctrl_col2:
+                wide_jpeg = image_to_jpeg_bytes(full_img)
+                st.download_button(
+                    label="⬇ Wide",
+                    data=wide_jpeg,
+                    file_name=f"spotlight_{i + 1:02d}_wide.jpg",
+                    mime="image/jpeg",
+                    key=f"spotlight_dl_wide_{i}",
+                )
+            with ctrl_col3:
+                crop_jpeg = image_to_jpeg_bytes(crop_img)
+                st.download_button(
+                    label="⬇ Close-up",
+                    data=crop_jpeg,
+                    file_name=f"spotlight_{i + 1:02d}_closeup.jpg",
+                    mime="image/jpeg",
+                    key=f"spotlight_dl_crop_{i}",
+                )
+
+        # Spotlight bulk controls
+        st.divider()
+        spotlight_sel = [i for i, v in enumerate(st.session_state.get("spotlight_selected", [])) if v]
+        n_spotlight_sel = len(spotlight_sel)
+
+        col_g, col_h, col_i = st.columns([3, 2, 2])
+        with col_g:
+            st.markdown(f"**{n_spotlight_sel} / {len(spotlight_frames)}** spotlight frames selected")
+        with col_h:
+            if st.button("✅ Select All", key="spotlight_sel_all", use_container_width=True):
+                st.session_state["spotlight_selected"] = [True] * len(spotlight_frames)
+                st.rerun()
+        with col_i:
+            if st.button("☐ Deselect All", key="spotlight_desel_all", use_container_width=True):
+                st.session_state["spotlight_selected"] = [False] * len(spotlight_frames)
+                st.rerun()
+
+        if n_spotlight_sel > 0:
+            spot_zip_buf = io.BytesIO()
+            with zipfile.ZipFile(spot_zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
+                for j, sidx in enumerate(spotlight_sel):
+                    full_img, crop_img, label = spotlight_frames[sidx]
+                    safe_label = label.replace(" ", "_").replace(":", "-").replace("/", "-").replace("@", "at").replace("(", "").replace(")", "")
+                    zf.writestr(f"spotlight_{j + 1:02d}_wide_{safe_label}.jpg", image_to_jpeg_bytes(full_img))
+                    zf.writestr(f"spotlight_{j + 1:02d}_closeup_{safe_label}.jpg", image_to_jpeg_bytes(crop_img))
+
+            st.download_button(
+                label=f"📦 Download {n_spotlight_sel} spotlight{'s' if n_spotlight_sel != 1 else ''} (wide + close-up) as ZIP",
+                data=spot_zip_buf.getvalue(),
+                file_name="spotlight_frames.zip",
+                mime="application/zip",
+                key="dl_spotlight_zip",
+            )
+
+    elif spotlight_picks > 0 and not spotlight_frames:
+        st.divider()
+        st.info("No solo spotlight moments found. This works best with group dance videos where dancers take turns standing out.")
+
+    # ── Combined download ─────────────────────────────────────────────────
+    active_pose_sel = pose_sel if (pose_picks > 0 and pose_frames) else []
+    active_spotlight_sel = spotlight_sel if (spotlight_picks > 0 and spotlight_frames) else []
+    total_selected = n_motion_sel + len(active_pose_sel) + len(active_spotlight_sel)
+    has_extras = len(active_pose_sel) > 0 or len(active_spotlight_sel) > 0
+
+    if total_selected > 0 and has_extras:
+        st.divider()
+        combined_zip = create_combined_zip(
+            frames,
+            motion_sel,
+            pose_frames if active_pose_sel else [],
+            active_pose_sel,
+            spotlight_frames if active_spotlight_sel else None,
+            active_spotlight_sel if active_spotlight_sel else None,
+        )
         st.download_button(
             label=f"📦 Download ALL {total_selected} selected frames as ZIP",
             data=combined_zip,
